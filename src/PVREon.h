@@ -239,6 +239,12 @@ private:
   bool PollNativeFragmentQueue(bool forceRefresh = false);
   bool LoadNextNativeFragment();
   bool FetchBinaryUrl(const std::string& url, std::vector<uint8_t>& data, int& statusCode);
+  time_t CurrentArchiveLiveEdgeTime(time_t programmeStartTime, time_t programmeEndTime) const;
+  bool ResolveProgrammeWindowAtTime(const EonChannel& channel,
+                                    time_t probeTime,
+                                    time_t& programmeStart,
+                                    time_t& programmeEnd,
+                                    bool& liveEdge);
   int64_t GetCurrentNativePosition() const;
   time_t GetCurrentNativeSeekableEndTime() const;
   time_t StreamPositionToTime(int64_t position) const;

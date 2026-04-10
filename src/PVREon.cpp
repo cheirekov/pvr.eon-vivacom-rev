@@ -39,6 +39,10 @@ constexpr time_t PENDING_PLAYBACK_TTL_SECONDS = 15;
 constexpr int64_t NATIVE_VIRTUAL_UNITS_PER_SECOND = 1000;
 constexpr time_t NATIVE_SEEK_RESTART_EPSILON_SECONDS = 2;
 constexpr time_t NATIVE_LIVE_EDGE_DELAY_SECONDS = 15;
+constexpr time_t NATIVE_EPG_LOOKBACK_SECONDS = 3600;
+constexpr time_t NATIVE_EPG_LOOKAHEAD_SECONDS = 6 * 3600;
+constexpr time_t NATIVE_INITIAL_LIVE_EDGE_SEEK_EPSILON_SECONDS = 2;
+constexpr int64_t NATIVE_INITIAL_LIVE_EDGE_SEEK_IGNORE_WINDOW_MS = 1500;
 constexpr int64_t NATIVE_INITIAL_SEEK_IGNORE_WINDOW_MS = 4000;
 constexpr int NATIVE_POLL_RETRY_COUNT = 10;
 constexpr auto NATIVE_POLL_RETRY_DELAY = std::chrono::milliseconds(200);
@@ -1320,6 +1324,78 @@ bool CPVREon::UseExperimentalNativeStream() const
   return m_settings->UseExperimentalNativeStream() && m_platform == PLATFORM_WEB;
 }
 
+time_t CPVREon::CurrentArchiveLiveEdgeTime(time_t programmeStartTime, time_t programmeEndTime) const
+{
+  if (programmeEndTime <= programmeStartTime)
+    return programmeStartTime;
+
+  const time_t now = time(nullptr);
+  const time_t delayedNow =
+      now > NATIVE_LIVE_EDGE_DELAY_SECONDS ? now - NATIVE_LIVE_EDGE_DELAY_SECONDS : now;
+  return std::clamp(delayedNow, programmeStartTime, std::max(programmeStartTime, programmeEndTime - 1));
+}
+
+bool CPVREon::ResolveProgrammeWindowAtTime(const EonChannel& channel,
+                                           time_t probeTime,
+                                           time_t& programmeStart,
+                                           time_t& programmeEnd,
+                                           bool& liveEdge)
+{
+  programmeStart = 0;
+  programmeEnd = 0;
+  liveEdge = false;
+
+  if (probeTime <= 0)
+    return false;
+
+  const time_t lookupStart = std::max<time_t>(probeTime - NATIVE_EPG_LOOKBACK_SECONDS, 0);
+  const time_t lookupEnd = probeTime + NATIVE_EPG_LOOKAHEAD_SECONDS;
+
+  std::string url = m_api + "v1/events/epg" +
+                    "?cid=" + std::to_string(channel.iUniqueId) +
+                    "&fromTime=" + std::to_string(lookupStart) + "000" +
+                    "&toTime=" + std::to_string(lookupEnd) + "000";
+
+  rapidjson::Document epgDoc;
+  if (!GetPostJson(url, "", epgDoc) || !epgDoc.IsObject())
+    return false;
+
+  const std::string cid = std::to_string(channel.iUniqueId);
+  if (!epgDoc.HasMember(cid.c_str()) || !epgDoc[cid.c_str()].IsArray())
+    return false;
+
+  const rapidjson::Value& epgItems = epgDoc[cid.c_str()];
+  for (rapidjson::Value::ConstValueIterator itr = epgItems.Begin(); itr != epgItems.End(); ++itr)
+  {
+    const rapidjson::Value& epgItem = *itr;
+    const time_t itemStart =
+        static_cast<time_t>(Utils::JsonInt64OrZero(epgItem, "startTime") / 1000);
+    const time_t itemEnd =
+        static_cast<time_t>(Utils::JsonInt64OrZero(epgItem, "endTime") / 1000);
+
+    if (itemEnd <= itemStart)
+      continue;
+
+    if (itemStart <= probeTime && itemEnd > probeTime)
+    {
+      programmeStart = itemStart;
+      programmeEnd = itemEnd;
+      liveEdge = probeTime > itemStart && probeTime < itemEnd;
+      kodi::Log(ADDON_LOG_INFO,
+                "Resolved programme window. channel=%s uid=%i probe=%lld start=%lld end=%lld liveEdge=%s",
+                channel.strChannelName.c_str(),
+                channel.iUniqueId,
+                static_cast<long long>(probeTime),
+                static_cast<long long>(programmeStart),
+                static_cast<long long>(programmeEnd),
+                BoolState(liveEdge));
+      return true;
+    }
+  }
+
+  return false;
+}
+
 bool CPVREon::OpenNativeStream(const EonChannel& channel,
                                bool isLive,
                                time_t starttime,
@@ -1884,7 +1960,9 @@ PVR_ERROR CPVREon::GetEPGTagStreamProperties(
         const time_t now = time(nullptr);
         const bool isInProgress =
             now > tag.GetStartTime() && now < tag.GetEndTime();
-        const time_t initialPlaybackTime = tag.GetStartTime();
+        const time_t initialPlaybackTime =
+            isInProgress ? CurrentArchiveLiveEdgeTime(tag.GetStartTime(), tag.GetEndTime())
+                         : tag.GetStartTime();
 
         m_pendingPlayback.active = true;
         m_pendingPlayback.liveEdge = isInProgress;
@@ -2106,9 +2184,36 @@ bool CPVREon::OpenLiveStream(const kodi::addon::PVRChannel& channel)
   }
 
   const time_t now = time(nullptr);
-  const bool usePendingArchive =
+  bool usePendingArchive =
       m_pendingPlayback.active && m_pendingPlayback.channelUid == addonChannel.iUniqueId &&
       now - m_pendingPlayback.requestTime <= PENDING_PLAYBACK_TTL_SECONDS;
+
+  if (!usePendingArchive && addonChannel.bArchive)
+  {
+    time_t currentProgrammeStart = 0;
+    time_t currentProgrammeEnd = 0;
+    bool currentProgrammeLiveEdge = false;
+    if (ResolveProgrammeWindowAtTime(addonChannel, now, currentProgrammeStart, currentProgrammeEnd,
+                                     currentProgrammeLiveEdge))
+    {
+      m_pendingPlayback.active = true;
+      m_pendingPlayback.liveEdge = currentProgrammeLiveEdge;
+      m_pendingPlayback.channelUid = addonChannel.iUniqueId;
+      m_pendingPlayback.startTime = currentProgrammeStart;
+      m_pendingPlayback.endTime = currentProgrammeEnd;
+      m_pendingPlayback.initialPlaybackTime =
+          CurrentArchiveLiveEdgeTime(currentProgrammeStart, currentProgrammeEnd);
+      m_pendingPlayback.requestTime = now;
+      usePendingArchive = true;
+      kodi::Log(ADDON_LOG_INFO,
+                "Queued native live switch as archive window. channel=%s uid=%i programmeStart=%lld programmeEnd=%lld initialPlayback=%lld",
+                addonChannel.strChannelName.c_str(),
+                addonChannel.iUniqueId,
+                static_cast<long long>(m_pendingPlayback.startTime),
+                static_cast<long long>(m_pendingPlayback.endTime),
+                static_cast<long long>(m_pendingPlayback.initialPlaybackTime));
+    }
+  }
 
   const time_t archiveStart = usePendingArchive ? m_pendingPlayback.startTime : 0;
   const time_t archiveEnd = usePendingArchive ? m_pendingPlayback.endTime : 0;
@@ -2180,11 +2285,27 @@ int64_t CPVREon::SeekLiveStream(int64_t position, int whence)
 
   targetPosition = std::clamp<int64_t>(targetPosition, 0, m_nativeStream.virtualLength);
   const int64_t currentPosition = GetCurrentNativePosition();
+  const int64_t startupAgeMs =
+      std::max<int64_t>(MonotonicNowMs() - m_nativeStream.openMonotonicMs, 0);
+
+  if (m_nativeStream.liveEdge && whence == SEEK_SET &&
+      startupAgeMs <= NATIVE_INITIAL_LIVE_EDGE_SEEK_IGNORE_WINDOW_MS &&
+      currentPosition >
+          (NATIVE_INITIAL_LIVE_EDGE_SEEK_EPSILON_SECONDS * m_nativeStream.virtualUnitsPerSecond) &&
+      targetPosition + (NATIVE_INITIAL_LIVE_EDGE_SEEK_EPSILON_SECONDS *
+                        m_nativeStream.virtualUnitsPerSecond) < currentPosition)
+  {
+    kodi::Log(ADDON_LOG_INFO,
+              "Ignoring initial Kodi live-edge startup seek. requested=%lld target=%lld current=%lld ageMs=%lld",
+              static_cast<long long>(position),
+              static_cast<long long>(targetPosition),
+              static_cast<long long>(currentPosition),
+              static_cast<long long>(startupAgeMs));
+    return currentPosition;
+  }
 
   if (m_nativeStream.ignoreInitialArchiveSeeks && whence == SEEK_SET && targetPosition > 0)
   {
-    const int64_t startupAgeMs =
-        std::max<int64_t>(MonotonicNowMs() - m_nativeStream.openMonotonicMs, 0);
     if (startupAgeMs <= NATIVE_INITIAL_SEEK_IGNORE_WINDOW_MS)
     {
       kodi::Log(ADDON_LOG_INFO,
